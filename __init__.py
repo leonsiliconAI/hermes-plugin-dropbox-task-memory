@@ -18,7 +18,6 @@ the Dropbox MCP tools and their confirmation rule.
 """
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import os
@@ -28,7 +27,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-from ._pythonmonkey import call
+from ._pythonmonkey import blocking, call
 
 LOG = logging.getLogger(__name__)
 
@@ -262,29 +261,12 @@ def _response(function, *args):
 
 
 def _run_policy(function, *args):
-    async def download(path):
-        return await asyncio.to_thread(_response, _download, path)
-
-    async def upload(path, text, mode):
-        if not isinstance(mode, str):
-            mode = dict(mode)
-        return await asyncio.to_thread(_response, _upload, path, text, mode)
-
-    async def metadata(path):
-        return await asyncio.to_thread(_response, _metadata, path)
-
-    async def list_page(cursor=None):
-        return await asyncio.to_thread(_response, _list_page, cursor)
-
-    async def move(source, destination):
-        return await asyncio.to_thread(_response, _move_file, source, destination)
-
     host = {
-        "download": download,
-        "upload": upload,
-        "metadata": metadata,
-        "list": list_page,
-        "move": move,
+        "download": blocking(lambda path: _response(_download, path)),
+        "upload": blocking(lambda path, text, mode: _response(_upload, path, text, mode)),
+        "metadata": blocking(lambda path: _response(_metadata, path)),
+        "list": blocking(lambda cursor: _response(_list_page, cursor)),
+        "move": blocking(lambda source, destination: _response(_move_file, source, destination)),
         "logWrite": lambda mode, meta: LOG.info(
             "dropbox-task-memory: %s %s (rev %s)", mode, meta.get("path_display"), meta.get("rev")),
         "logMove": lambda source, moved: LOG.info(
