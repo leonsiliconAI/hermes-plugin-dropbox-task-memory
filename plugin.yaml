@@ -1,0 +1,13 @@
+name: dropbox-task-memory
+label: Dropbox task memory
+version: 1.0.0
+description: >
+  Read and save Hermes's per-issue task notes at Dropbox /Agents/Memory/<linear-slug>.md without a
+  chat confirmation for every write (Leon's standing authorization, 2026-11-11). Can't delete,
+  share, or write anywhere else; other Dropbox changes stay on the Dropbox MCP and its confirmation.
+author: leonsilicon
+provides_tools:
+  - dropbox_task_memory_read
+  - dropbox_task_memory_list
+  - dropbox_task_memory_write
+  - dropbox_task_memory_move
