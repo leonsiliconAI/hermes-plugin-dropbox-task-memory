@@ -39,7 +39,7 @@ The write and move tool descriptions carry the authorization: Leon's dated stand
 
 1. Get a refresh token for the plugin's own grant. Use a PKCE authorization on a Dropbox app with Full Dropbox access and public-client (PKCE) support. Captain Claude reuses Leon's "Hermes Captain Claude MCP" app (`z5alyoo8rmc0id7`), but this is a separate grant from the MCP server's. Request only the three scopes above and `token_access_type=offline`, and omit `redirect_uri` so Dropbox shows the code. Exchange the code with the verifier at `https://api.dropboxapi.com/oauth2/token`. You can do the exchange in the dashboard page, so the token never leaves it.
 2. Put `DROPBOX_TASK_MEMORY_REFRESH_TOKEN` and `DROPBOX_TASK_MEMORY_APP_KEY` in `$HERMES_HOME/.env` (`PUT /api/env` on Hermes Cloud).
-3. Install the Git mirror with `hermes plugins install leonsiliconAI/hermes-plugin-dropbox-task-memory --enable`. See [migration steps](https://github.com/leonsilicon/leonsilicon.ai/blob/main/DEVELOPMENT.md#hermes-plugin-mirrors) for an existing install.
+3. Install the Git mirror with `hermes plugins install leonsiliconAI/hermes-plugin-dropbox-task-memory --enable --yes-deps`. See [migration steps](https://github.com/leonsilicon/leonsilicon.ai/blob/main/DEVELOPMENT.md#hermes-plugin-mirrors) for an existing install.
 4. Restart the gateway. The log shows `dropbox-task-memory: dropbox_task_memory_read, ... registered for /Agents/Memory`.
 5. Tell Hermes to use it. On Captain Claude, the `branch-task-memory` skill and one line in `memories/MEMORY.md` say to save notes with these tools without asking, and to keep using the Dropbox MCP, with confirmation, for anything else.
 

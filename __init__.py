@@ -18,15 +18,17 @@ the Dropbox MCP tools and their confirmation rule.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
-import re
 import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+
+from ._pythonmonkey import call
 
 LOG = logging.getLogger(__name__)
 
@@ -38,15 +40,12 @@ REFRESH_TOKEN_ENV = "DROPBOX_TASK_MEMORY_REFRESH_TOKEN"
 APP_KEY_ENV = "DROPBOX_TASK_MEMORY_APP_KEY"
 
 ROOT = "/Agents/Memory"
-SOURCE_ROOT = "/Agents"
 MAX_BYTES = 512 * 1024
 API = "https://api.dropboxapi.com"
 CONTENT = "https://content.dropboxapi.com"
 VERSIONS_HELP = "https://help.dropbox.com/delete-restore/recover-older-versions"
 
 # The issue identifier, then the title words from the Linear URL: leon-330-prepare-separate-...
-_SLUG = re.compile(r"^[a-z][a-z0-9]{0,9}-\d{1,6}(?:-[a-z0-9]+)*$")
-_MAX_SLUG = 150
 
 _LOCK = threading.Lock()
 _TOKEN: dict[str, float | str] = {}
@@ -130,34 +129,23 @@ def available() -> bool:
     return bool(os.environ.get(REFRESH_TOKEN_ENV, "").strip() and os.environ.get(APP_KEY_ENV, "").strip())
 
 
-def _ok(**fields) -> str:
-    return json.dumps({"success": True, **fields})
-
-
 def _error(message: str) -> str:
     return json.dumps({"success": False, "error": message})
 
 
+def _valid_path(function, value) -> str:
+    result = call(__file__, function, str(value or ""))
+    if "error" in result:
+        raise ValueError(result["error"])
+    return result["path"]
+
+
 def note_path(slug: str) -> str:
-    """The note's Dropbox path, or ValueError for anything that isn't a plain Linear slug."""
-    slug = str(slug or "").strip().lower()
-    if slug.endswith(".md"):
-        slug = slug[:-3]
-    if len(slug) > _MAX_SLUG or not _SLUG.match(slug):
-        raise ValueError(
-            "slug must be a Linear issue slug like leon-330-prepare-separate-st-george-chapter-sop-application "
-            "(lowercase letters, digits and hyphens; no folders)")
-    return f"{ROOT}/{slug}.md"
+    return _valid_path("notePath", slug)
 
 
 def source_path(path: str) -> str:
-    """A move source: a plain absolute path strictly inside /Agents/, or ValueError."""
-    path = str(path or "").strip()
-    parts = path.split("/")
-    if (not path.startswith("/") or "\\" in path or any(p in ("", ".", "..") for p in parts[1:])
-            or len(parts) < 3 or parts[1].lower() != SOURCE_ROOT[1:].lower()):
-        raise ValueError("source_path must be a file path inside /Agents/, e.g. /Agents/Branches/leon-330-x/memory.md")
-    return path
+    return _valid_path("sourcePath", path)
 
 
 # --- Dropbox HTTP API -------------------------------------------------------------------------
@@ -233,14 +221,14 @@ def _metadata(path: str) -> dict | None:
         raise
 
 
-def _download(path: str) -> tuple[dict, str] | None:
+def _download(path: str) -> list | None:
     try:
         meta, raw = _call(f"{CONTENT}/2/files/download", arg={"path": path}, content=True)
     except DropboxError as exc:
         if exc.status == 409 and "not_found" in exc.summary:
             return None
         raise
-    return meta, raw.decode("utf-8", "replace")
+    return [meta, raw.decode("utf-8", "replace")]
 
 
 def _upload(path: str, text: str, mode) -> dict:
@@ -250,101 +238,77 @@ def _upload(path: str, text: str, mode) -> dict:
     return meta
 
 
-def _summary(meta: dict) -> dict:
-    return {key: meta.get(key) for key in ("path_display", "rev", "size", "server_modified") if meta.get(key) is not None}
+def _list_page(cursor=None):
+    if cursor is None:
+        result, _ = _call(f"{API}/2/files/list_folder", arg={"path": ROOT, "recursive": False, "limit": 500})
+    else:
+        result, _ = _call(f"{API}/2/files/list_folder/continue", arg={"cursor": cursor})
+    return result
 
 
-# --- Tools ------------------------------------------------------------------------------------
+def _move_file(source, destination):
+    result, _ = _call(f"{API}/2/files/move_v2", arg={
+        "from_path": source, "to_path": destination, "autorename": False,
+        "allow_ownership_transfer": False})
+    return result
+
+
+def _response(function, *args):
+    try:
+        value = function(*args)
+        return {"value": value} if value is not None else {}
+    except DropboxError as exc:
+        return {"error": str(exc), "summary": exc.summary, "status": exc.status}
+
+
+def _run_policy(function, *args):
+    async def download(path):
+        return await asyncio.to_thread(_response, _download, path)
+
+    async def upload(path, text, mode):
+        if not isinstance(mode, str):
+            mode = dict(mode)
+        return await asyncio.to_thread(_response, _upload, path, text, mode)
+
+    async def metadata(path):
+        return await asyncio.to_thread(_response, _metadata, path)
+
+    async def list_page(cursor=None):
+        return await asyncio.to_thread(_response, _list_page, cursor)
+
+    async def move(source, destination):
+        return await asyncio.to_thread(_response, _move_file, source, destination)
+
+    host = {
+        "download": download,
+        "upload": upload,
+        "metadata": metadata,
+        "list": list_page,
+        "move": move,
+        "logWrite": lambda mode, meta: LOG.info(
+            "dropbox-task-memory: %s %s (rev %s)", mode, meta.get("path_display"), meta.get("rev")),
+        "logMove": lambda source, moved: LOG.info(
+            "dropbox-task-memory: moved %s to %s", source.get("path_display"), moved.get("path_display")),
+        "byteLength": lambda text: len(text.encode("utf-8")),
+    }
+    return json.dumps(call(__file__, function, host, *args))
+
 
 def handle_read(args: dict, **_kw) -> str:
-    try:
-        path = note_path(args.get("slug"))
-        found = _download(path)
-    except (ValueError, DropboxError) as exc:
-        return _error(str(exc))
-    if found is None:
-        return _ok(exists=False, path=path)
-    meta, text = found
-    return _ok(exists=True, content=text, **_summary(meta))
+    return _run_policy("read", str(args.get("slug") or ""))
 
 
 def handle_list(args: dict, **_kw) -> str:
-    try:
-        entries: list[dict] = []
-        result, _ = _call(f"{API}/2/files/list_folder", arg={"path": ROOT, "recursive": False, "limit": 500})
-        while True:
-            entries += [{"name": e.get("name"), "path_display": e.get("path_display"),
-                         "server_modified": e.get("server_modified"), "size": e.get("size")}
-                        for e in result.get("entries", []) if e.get(".tag") == "file"]
-            if not result.get("has_more"):
-                break
-            result, _ = _call(f"{API}/2/files/list_folder/continue", arg={"cursor": result["cursor"]})
-    except DropboxError as exc:
-        if exc.status == 409 and "not_found" in exc.summary:
-            return _ok(notes=[], note=f"{ROOT} does not exist yet; the first write creates it")
-        return _error(str(exc))
-    return _ok(notes=sorted(entries, key=lambda e: str(e["name"]).lower()))
+    return _run_policy("list")
 
 
 def handle_write(args: dict, **_kw) -> str:
-    mode = str(args.get("mode") or "")
-    text = args.get("content")
-    if not isinstance(text, str) or not text.strip():
-        return _error("content is required")
-    try:
-        path = note_path(args.get("slug"))
-        if mode == "create":
-            meta = _upload(path, text, "add")
-        elif mode == "append":
-            found = _download(path)
-            if found is None:
-                meta = _upload(path, text, "add")
-            else:
-                old_meta, old_text = found
-                joined = old_text if old_text.endswith("\n") or not old_text else old_text + "\n"
-                text = joined + text
-                if len(text.encode("utf-8")) > MAX_BYTES:
-                    return _error(f"the note would grow past {MAX_BYTES // 1024} KB; condense it with mode=replace")
-                meta = _upload(path, text, {".tag": "update", "update": old_meta["rev"]})
-        elif mode == "replace":
-            rev = str(args.get("rev") or "").strip()
-            if not rev:
-                return _error("mode=replace needs the rev from dropbox_task_memory_read; read the note first")
-            meta = _upload(path, text, {".tag": "update", "update": rev})
-        else:
-            return _error("mode must be create, append or replace")
-    except ValueError as exc:
-        return _error(str(exc))
-    except DropboxError as exc:
-        if "conflict" in exc.summary:
-            hint = ("a note already exists there; read it and use mode=append or mode=replace"
-                    if mode == "create" else "the note changed since it was read; read it again and retry")
-            return _error(f"{exc.summary}: {hint}")
-        return _error(str(exc))
-    LOG.info("dropbox-task-memory: %s %s (rev %s)", mode, meta.get("path_display"), meta.get("rev"))
-    return _ok(action=mode, revert=f"Earlier versions stay in Dropbox's version history: {VERSIONS_HELP}",
-               **_summary(meta))
+    return _run_policy("write", str(args.get("slug") or ""), str(args.get("mode") or ""),
+                       args.get("content"), str(args.get("rev") or "").strip(), MAX_BYTES, VERSIONS_HELP)
 
 
 def handle_move(args: dict, **_kw) -> str:
-    try:
-        source = source_path(args.get("source_path"))
-        destination = note_path(args.get("slug"))
-        meta = _metadata(source)
-        if meta is None:
-            return _error(f"{source} does not exist")
-        if meta.get(".tag") != "file":
-            return _error(f"{source} is a {meta.get('.tag', 'non-file')}; only files can be moved into {ROOT}")
-        result, _ = _call(f"{API}/2/files/move_v2", arg={
-            "from_path": source, "to_path": destination, "autorename": False,
-            "allow_ownership_transfer": False})
-    except (ValueError, DropboxError) as exc:
-        return _error(str(exc))
-    moved = result.get("metadata") or {}
-    LOG.info("dropbox-task-memory: moved %s to %s", meta.get("path_display"), moved.get("path_display"))
-    return _ok(action="move", moved_from=meta.get("path_display") or source,
-               revert="Move it back with the Dropbox MCP move tool (that one asks Leon first).",
-               **_summary(moved))
+    return _run_policy("move", str(args.get("source_path") or ""), str(args.get("slug") or ""))
 
 
 def _guarded(handler):

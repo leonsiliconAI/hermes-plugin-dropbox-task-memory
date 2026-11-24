@@ -6,14 +6,18 @@ import importlib.util
 import io
 import json
 import pathlib
+import sys
 import types
 import urllib.error
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
 
 import pytest
 
 _spec = importlib.util.spec_from_file_location(
     "dropbox_task_memory", pathlib.Path(__file__).resolve().parents[1] / "__init__.py")
 plugin = importlib.util.module_from_spec(_spec)
+sys.modules[_spec.name] = plugin
 _spec.loader.exec_module(plugin)
 
 SLUG = "leon-330-prepare-separate-st-george-chapter-sop-application"
@@ -153,6 +157,21 @@ def test_create_then_read_back(dropbox, tools):
     assert read["exists"] and read["content"] == "# LEON-330\n" and read["rev"] == result["rev"]
     assert dropbox.calls[0] == ("/2/files/upload", {"path": NOTE, "mode": "add", "autorename": False,
                                                     "mute": True, "strict_conflict": True})
+
+
+def test_concurrent_tool_calls_can_await_host_io(dropbox, tools, monkeypatch):
+    dropbox.put(NOTE, "notes")
+    both_downloads = Barrier(2)
+    download = plugin._download
+
+    def concurrent_download(path):
+        both_downloads.wait(timeout=5)
+        return download(path)
+
+    monkeypatch.setattr(plugin, "_download", concurrent_download)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        calls = [pool.submit(tools[plugin.READ], {"slug": SLUG}) for _ in range(2)]
+        assert [call.result(timeout=10)["content"] for call in calls] == ["notes", "notes"]
 
 
 def test_create_refuses_to_clobber(dropbox, tools):
