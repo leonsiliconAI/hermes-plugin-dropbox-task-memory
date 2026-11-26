@@ -1,6 +1,6 @@
 {
   "name": "@-/com.leonsilicon.hermes.plugins.dropbox-task-memory",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "private": true,
   "description": "Hermes plugin: task-memory notes in Dropbox /Agents/Memory without a confirmation per write.",
   "type": "module",
